@@ -1,0 +1,64 @@
+# claude-code-rc-monitor
+
+> Keep a Claude Code remote control (/rc) session alive automatically inside tmux.
+
+## What this project does
+
+claude-code-rc-monitor is a single-file Python 3 utility (no dependencies) that monitors a Claude Code CLI session running in a tmux pane and automatically reconnects its remote control (/rc) session. Remote control allows accessing a local Claude Code session from claude.ai/code or the Claude mobile app. Sessions can disconnect due to network timeouts or inactivity — this tool reconnects them with the same session name.
+
+## Key facts
+
+- Language: Python 3 (standard library only)
+- Platforms: macOS, Linux
+- Requires: tmux, Claude Code CLI (`claude`)
+- Single file: `claude-code-rc-monitor` (executable script)
+- License: MIT
+
+## Quick install
+
+```
+curl -fsSL https://raw.githubusercontent.com/iceraj/cloude-code-remote-control-restart/main/claude-code-rc-monitor -o claude-code-rc-monitor && chmod +x claude-code-rc-monitor
+```
+
+## How it works
+
+1. Finds the Claude Code process running in the current tmux session by matching `ps` output against tmux pane shell PIDs
+2. Validates exactly one Claude instance exists (exits with error otherwise)
+3. Waits for Claude to be idle — polls `tmux capture-pane` checking for absence of "esc to interrupt" in the status bar (5s interval, 5min timeout)
+4. Sends `/remote-control` via `tmux send-keys`, then reads pane output via `tmux capture-pane` to determine state:
+   - If RC was active: menu appears with "Disconnect this session" — navigates Up+Up+Enter to disconnect, verifies "Remote Control disconnected" in pane output
+   - If RC was not active: `/remote-control` auto-starts a session — detects "Remote Control connecting" in pane, disconnects the auto-started session, then proceeds
+5. Sends `/rc <session-name>` to start a fresh remote control session with the specified name
+6. Reads pane output to verify "Remote Control connecting" or "Remote Control active"
+7. Sleeps for 1 hour (configurable via `REFRESH_INTERVAL` constant)
+8. Wakes on: timeout (1h), Enter key, SIGUSR1 signal, or SIGHUP signal
+9. Loops back to step 1
+
+## Usage
+
+```
+claude-code-rc-monitor <session-name>
+```
+
+The session name is the display name shown in claude.ai/code for the remote control session.
+
+## Architecture
+
+- `get_tmux_session()` — detects current tmux session via `tmux display-message`
+- `find_claude_panes(session)` — lists tmux panes, cross-references with `ps -eo pid,ppid,command` to find claude child processes
+- `tmux_send_keys(target, *keys)` — sends keystrokes to a tmux pane using `subprocess.run(["tmux", "send-keys", ...])` (no shell interpretation)
+- `capture_pane(target)` — reads visible pane contents via `tmux capture-pane -p` for state verification
+- `wait_for_idle(target, timeout)` — polls pane output every 5s until "esc to interrupt" is absent (Claude is idle), times out after 5 minutes
+- `restart_rc(target, name)` — waits for idle, disconnects existing /rc via menu navigation (with pane-reading state detection), then starts new /rc with given name and verifies connection
+- `wait_for_trigger()` — uses `select.select()` on stdin with 1-second polling for signal checks
+
+## Important implementation details
+
+- tmux send-keys must send each arrow key as a separate call with delays (0.3s) between them for Claude's TUI to process menu navigation correctly
+- The `/remote-control` command opens an interactive menu (Disconnect / Show QR / Continue) when RC is active — automated disconnect requires Up+Up+Enter navigation
+- When RC is NOT active, `/remote-control` auto-starts a new unnamed session instead of showing the menu — the monitor detects this by reading pane output ("Remote Control connecting") and disconnects the auto-started session before reconnecting with the correct name
+- `tmux capture-pane -p` is used to read pane contents for state verification after each step (idle check, disconnect confirmed, connection confirmed)
+- Claude's TUI status bar shows "esc to interrupt" only when actively thinking — absence of this string indicates idle state
+- Process detection uses parent PID matching: tmux pane PID → shell PID → claude child PID
+- `pgrep -P` is unreliable on macOS; uses `ps -eo pid,ppid,command` instead
+- All subprocess calls use list args (`subprocess.run(["tmux", ...])`) instead of `shell=True` to avoid quoting issues with session names containing special characters
