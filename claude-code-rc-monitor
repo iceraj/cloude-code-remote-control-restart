@@ -44,8 +44,32 @@ def get_tmux_session():
     return out
 
 
+def _is_claude_command(cmd):
+    """Check if a command string is a claude process.
+
+    Matches 'claude', 'claude --flags', '/path/to/claude', etc.
+    """
+    exe = cmd.split()[0] if cmd.split() else ""
+    basename = os.path.basename(exe)
+    return basename == "claude"
+
+
+def _get_descendants(pid, children_map):
+    """Return all descendant PIDs of the given pid (breadth-first)."""
+    descendants = []
+    queue = list(children_map.get(pid, []))
+    while queue:
+        child = queue.pop(0)
+        descendants.append(child)
+        queue.extend(children_map.get(child, []))
+    return descendants
+
+
 def find_claude_panes(session):
-    """Find panes whose shell has a claude child process.
+    """Find panes whose shell has a claude descendant process.
+
+    Walks the full process tree so that wrapper scripts like
+    bin/myclaude.sh -> claude --options are detected.
 
     Returns a list of (tmux_target, claude_pid) tuples.
     """
@@ -67,14 +91,24 @@ def find_claude_panes(session):
         return []
 
     ps_out, _ = run_cmd(["ps", "-eo", "pid,ppid,command"])
-    claude_panes = []
+
+    # Build a children map and a command map from ps output
+    children_map = {}  # parent_pid -> [child_pids]
+    cmd_map = {}       # pid -> command string
     for line in ps_out.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3:
             continue
         pid, ppid, cmd = parts
-        if ppid in shell_pids and cmd.startswith("claude "):
-            claude_panes.append((shell_pids[ppid], pid))
+        cmd_map[pid] = cmd
+        children_map.setdefault(ppid, []).append(pid)
+
+    # For each pane shell, walk descendants to find claude
+    claude_panes = []
+    for shell_pid, tmux_target in shell_pids.items():
+        for desc_pid in _get_descendants(shell_pid, children_map):
+            if desc_pid in cmd_map and _is_claude_command(cmd_map[desc_pid]):
+                claude_panes.append((tmux_target, desc_pid))
 
     return claude_panes
 
